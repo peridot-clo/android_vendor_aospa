@@ -1,2 +1,3 @@
 # Allow recovery to read the AOSPA version.
 get_prop(recovery, aospa_build_prop)
+r_dir_file(recovery, sysfs_fs_f2fs)
