@@ -102,6 +102,60 @@ if [ ! -d "$DIR_ROOT/vendor/aospa" ]; then
         exit 1
 fi
 
+# BEGIN disk-backed build temporary files
+# Python signing tools run outside Soong's out/soong/.temp environment.
+BUILD_TMP_ENV="${XDG_CONFIG_HOME:-$HOME/.config}/android-build-env.sh"
+if [ -r "$BUILD_TMP_ENV" ]; then
+    . "$BUILD_TMP_ENV" || exit 1
+fi
+case "${TMPDIR:-}" in
+    ""|/tmp|/tmp/*|/dev/shm|/dev/shm/*)
+        TMPDIR="${ANDROID_BUILD_TMPDIR:-${HOME}/.cache/android-build-tmp}"
+        ;;
+esac
+if ! (umask 077; mkdir -p -- "$TMPDIR") || [ ! -w "$TMPDIR" ] || [ ! -x "$TMPDIR" ]; then
+    echo "Cannot create or access build temporary directory: $TMPDIR" >&2
+    exit 1
+fi
+TMPDIR=$(CDPATH= cd -- "$TMPDIR" && pwd -P) || exit 1
+if [ "$(stat -f -c %T "$TMPDIR" 2>/dev/null)" = tmpfs ]; then
+    echo "Build TMPDIR must be disk-backed, not quota-limited tmpfs: $TMPDIR" >&2
+    exit 1
+fi
+export TMPDIR
+export TMP="$TMPDIR" TEMP="$TMPDIR"
+echo "Using build temporary directory: $TMPDIR"
+
+# Releasetools parses --java_args with shlex; preserve paths containing spaces.
+JAVA_TMPDIR_ESCAPED="${TMPDIR//\\/\\\\}"
+JAVA_TMPDIR_ESCAPED="${JAVA_TMPDIR_ESCAPED//\"/\\\"}"
+RELEASETOOLS_JAVA_ARGS="-Xmx4096m \"-Djava.io.tmpdir=$JAVA_TMPDIR_ESCAPED\""
+
+checkBuildDiskSpace() {
+    local min_gib="${ROM_BUILD_MIN_FREE_GB:-60}" available path
+    local output_path="${ANDROID_PRODUCT_OUT:-${OUT_DIR:-out}}"
+    if ! [[ "$min_gib" =~ ^[1-9][0-9]{0,4}$ ]]; then
+        echo "ROM_BUILD_MIN_FREE_GB must be a positive integer (default: 60)." >&2
+        return 1
+    fi
+    [[ "$output_path" = /* ]] || output_path="$DIR_ROOT/$output_path"
+    while [ ! -e "$output_path" ]; do
+        output_path=$(dirname -- "$output_path")
+    done
+    for path in "$TMPDIR" "$output_path" "$DIR_ROOT"; do
+        available=$(LC_ALL=C df -Pk "$path" | awk 'NR == 2 { print $4 }')
+        if ! [[ "$available" =~ ^[0-9]+$ ]]; then
+            echo "Cannot determine available disk space for: $path" >&2
+            return 1
+        fi
+        if (( available < min_gib * 1024 * 1024 )); then
+            echo "Insufficient build space at $path: $((available / 1024 / 1024)) GiB free; need at least $min_gib GiB." >&2
+            return 1
+        fi
+    done
+}
+# END disk-backed build temporary files
+
 # Setup AOSPA variant if specified
 if [ $AOSPA_VARIANT ]; then
     AOSPA_VARIANT=`echo $AOSPA_VARIANT |  tr "[:upper:]" "[:lower:]"`
@@ -195,6 +249,11 @@ if [ "$FLAG_INSTALLCLEAN_BUILD" = 'y' ]; then
 	m installclean "$CMD"
 fi
 
+# Check after installclean has released old images, before expensive compilation.
+if [ -z "${MODULES[*]}" ]; then
+    checkBuildDiskSpace || exit 1
+fi
+
 # Build away!
 echo -e "${CLR_BLD_BLU}Starting compilation${CLR_RST}"
 echo -e ""
@@ -239,14 +298,14 @@ elif [ "${KEY_MAPPINGS}" ]; then
     checkExit
 
     echo -e "${CLR_BLD_BLU}Signing target files apks${CLR_RST}"
-    sign_target_files_apks -o -d $KEY_MAPPINGS \
+    sign_target_files_apks --java_args="$RELEASETOOLS_JAVA_ARGS" -o -d $KEY_MAPPINGS \
         "$OUT"/obj/PACKAGING/target_files_intermediates/aospa_$DEVICE-target_files.zip \
         aospa-$AOSPA_VERSION-signed-target_files.zip
 
     checkExit
 
     echo -e "${CLR_BLD_BLU}Generating signed install package${CLR_RST}"
-    ota_from_target_files -k $KEY_MAPPINGS/releasekey \
+    ota_from_target_files --java_args="$RELEASETOOLS_JAVA_ARGS" -k $KEY_MAPPINGS/releasekey \
         --block ${INCREMENTAL} \
         aospa-$AOSPA_VERSION-signed-target_files.zip \
         aospa-$AOSPA_VERSION.zip
@@ -259,7 +318,7 @@ elif [ "${KEY_MAPPINGS}" ]; then
                 echo -e "${CLR_BLD_RED}Delta error: base target files don't exist ($DELTA_TARGET_FILES)${CLR_RST}"
                 exit 1
         fi
-        ota_from_target_files -k $KEY_MAPPINGS/releasekey \
+        ota_from_target_files --java_args="$RELEASETOOLS_JAVA_ARGS" -k $KEY_MAPPINGS/releasekey \
             --block --incremental_from $DELTA_TARGET_FILES \
             aospa-$AOSPA_VERSION-signed-target_files.zip \
             aospa-$AOSPA_VERSION-delta.zip
@@ -280,7 +339,7 @@ elif [ "$FLAG_IMG_ZIP" = 'y' ]; then
     checkExit
 
     echo -e "${CLR_BLD_BLU}Generating install package${CLR_RST}"
-    ota_from_target_files \
+    ota_from_target_files --java_args="$RELEASETOOLS_JAVA_ARGS" \
         "$OUT"/obj/PACKAGING/target_files_intermediates/aospa_$DEVICE-target_files.zip \
         aospa-$AOSPA_VERSION.zip
 
